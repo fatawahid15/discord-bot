@@ -1,6 +1,6 @@
 import { SlashCommandBuilder } from '@discordjs/builders';
 import { ChatInputCommandInteraction, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType } from 'discord.js';
-import { request } from 'undici';
+import { jikanArray, jikanObject, logCollectorError, randomJikanId, validMalId } from '../jikan';
 
 // --- Jikan API Interfaces ---
 interface JikanManga {
@@ -89,39 +89,33 @@ export const data = new SlashCommandBuilder()
             )
     );
 
-async function fetchAndSendMangaRecommendation(interaction: ChatInputCommandInteraction, genre: string | null) {
+async function fetchMangaRecommendation(genre: string | null) {
     try {
         let mangaId: number;
 
         if (genre) {
-            const genresResponse = await request('https://api.jikan.moe/v4/genres/manga');
-            const genresData = await genresResponse.body.json() as JikanGenresResponse;
-            const genreObj = genresData.data.find((g: JikanGenre) => g.name.toLowerCase() === genre.toLowerCase());
+            const genresData = await jikanArray<JikanGenre>('/genres/manga');
+            const genreObj = genresData.find((g: JikanGenre) => g.name.toLowerCase() === genre.toLowerCase());
 
             if (!genreObj) {
-                await interaction.editReply(`Could not find the genre "${genre}". Please check the spelling.`);
-                return { content: `Could not find the genre "${genre}". Please check the spelling.` };
+                return { ok: false as const, content: `Could not find the genre "${genre}". Please check the spelling.` };
             }
 
-            const mangaResponse = await request(`https://api.jikan.moe/v4/manga?genres=${genreObj.mal_id}&order_by=score&sort=desc`);
-            const mangaData = await mangaResponse.body.json() as JikanMangaSearchResponse;
+            const mangaData = await jikanArray<JikanManga>(`/manga?genres=${genreObj.mal_id}&order_by=score&sort=desc`);
 
-            if (!mangaData.data || mangaData.data.length === 0) {
-                await interaction.editReply(`Could not find any manga in the "${genre}" genre.`);
-                return { content: `Could not find any manga in the "${genre}" genre.` };
+            const candidates = mangaData.filter(item => validMalId(item?.mal_id));
+            if (!candidates.length) {
+                return { ok: false as const, content: `Could not find any manga in the "${genre}" genre.` };
             }
 
-            mangaId = mangaData.data[Math.floor(Math.random() * mangaData.data.length)].mal_id;
+            mangaId = candidates[Math.floor(Math.random() * candidates.length)].mal_id;
 
         } else {
-            const randomResponse = await request('https://api.jikan.moe/v4/random/manga');
-            const randomData = await randomResponse.body.json() as JikanRandomMangaResponse;
-            mangaId = randomData.data.mal_id;
+            mangaId = await randomJikanId('manga');
         }
 
-        const fullMangaResponse = await request(`https://api.jikan.moe/v4/manga/${mangaId}/full`);
-        const fullMangaData = await fullMangaResponse.body.json() as JikanMangaFullResponse;
-        const manga = fullMangaData.data;
+        const manga = await jikanObject<JikanMangaFull>(`/manga/${mangaId}/full`);
+        if (!manga.title || !manga.url || !manga.images?.jpg?.image_url) throw new Error('Jikan returned incomplete manga data.');
 
         const mangaEmbed = new EmbedBuilder()
             .setColor('#e55c3a')
@@ -140,7 +134,7 @@ async function fetchAndSendMangaRecommendation(interaction: ChatInputCommandInte
                 },
                 { 
                     name: '\⭐ Popularity', 
-                    value: `• **Score:** ${manga.score ? manga.score.toString() : 'N/A'}/100\n• **Rank:** #${manga.rank ? manga.rank.toString() : 'N/A'}\n• **Popularity Rank:** #${manga.popularity ? manga.popularity.toString() : 'N/A'}`,
+                    value: `• **Score:** ${manga.score ? manga.score.toString() : 'N/A'}/10\n• **Rank:** #${manga.rank ? manga.rank.toString() : 'N/A'}\n• **Popularity Rank:** #${manga.popularity ? manga.popularity.toString() : 'N/A'}`,
                     inline: true
                 }
             )
@@ -149,16 +143,16 @@ async function fetchAndSendMangaRecommendation(interaction: ChatInputCommandInte
         const row = new ActionRowBuilder<ButtonBuilder>()
             .addComponents(
                 new ButtonBuilder()
-                    .setCustomId('next_recommendation')
+                    .setCustomId('manga:recommend:next')
                     .setLabel('Next Recommendation')
                     .setStyle(ButtonStyle.Primary)
             );
 
-        return { embeds: [mangaEmbed], components: [row] };
+        return { ok: true as const, embeds: [mangaEmbed], components: [row] };
 
     } catch (error) {
         console.error('Manga recommendation failed:', error);
-        return { content: 'An error occurred while fetching a manga recommendation. Please try again later.' };
+        return { ok: false as const, content: 'Manga recommendations are temporarily unavailable. Please try again later.' };
     }
 }
 
@@ -173,18 +167,18 @@ export const execute = async (interaction: ChatInputCommandInteraction) => {
         }
 
         try {
-            const mangaResponse = await request(`https://api.jikan.moe/v4/manga?q=${encodeURIComponent(title)}`);
-            const mangaData = await mangaResponse.body.json() as JikanMangaSearchResponse;
+            const mangaData = (await jikanArray<JikanManga>(`/manga?q=${encodeURIComponent(title)}`))
+                .filter(item => Boolean(item?.title && item?.url && item?.images?.jpg?.image_url));
 
-            if (!mangaData.data || mangaData.data.length === 0) {
+            if (mangaData.length === 0) {
                 await interaction.editReply(`Could not find any results for "${title}".`);
                 return;
             }
 
             const pagedEmbeds: EmbedBuilder[][] = [];
             const itemsPerPage = 5;
-            for (let i = 0; i < mangaData.data.length; i += itemsPerPage) {
-                const chunk = mangaData.data.slice(i, i + itemsPerPage);
+            for (let i = 0; i < mangaData.length; i += itemsPerPage) {
+                const chunk = mangaData.slice(i, i + itemsPerPage);
                 const pageEmbeds = chunk.map(manga => {
                     return new EmbedBuilder()
                         .setColor('#e55c3a')
@@ -208,12 +202,12 @@ export const execute = async (interaction: ChatInputCommandInteraction) => {
             const row = new ActionRowBuilder<ButtonBuilder>()
                 .addComponents(
                     new ButtonBuilder()
-                        .setCustomId('previous')
+                        .setCustomId('manga:search:previous')
                         .setLabel('Previous')
                         .setStyle(ButtonStyle.Primary)
                         .setDisabled(true),
                     new ButtonBuilder()
-                        .setCustomId('next')
+                        .setCustomId('manga:search:next')
                         .setLabel('Next')
                         .setStyle(ButtonStyle.Primary)
                         .setDisabled(pagedEmbeds.length === 1)
@@ -226,71 +220,88 @@ export const execute = async (interaction: ChatInputCommandInteraction) => {
 
             const collector = message.createMessageComponentCollector({ componentType: ComponentType.Button, time: 60000 });
 
-            collector.on('collect', async i => {
-                if (i.user.id !== interaction.user.id) {
-                    i.reply({ content: `These buttons aren\'t for you!`, ephemeral: true });
-                    return;
-                }
-
-                if (i.customId === 'next') {
-                    currentPage++;
-                } else if (i.customId === 'previous') {
-                    currentPage--;
-                }
-
-                row.components[0].setDisabled(currentPage === 0);
-                row.components[1].setDisabled(currentPage === pagedEmbeds.length - 1);
-
-                await i.update({
-                    embeds: pagedEmbeds[currentPage],
-                    components: [row]
-                });
+            collector.on('collect', i => {
+                void (async () => {
+                    if (i.user.id !== interaction.user.id) {
+                        await i.reply({ content: `These buttons aren\'t for you!`, ephemeral: true });
+                        return;
+                    }
+                    if (i.customId === 'manga:search:next') currentPage++;
+                    else if (i.customId === 'manga:search:previous') currentPage--;
+                    currentPage = Math.max(0, Math.min(currentPage, pagedEmbeds.length - 1));
+                    row.components[0].setDisabled(currentPage === 0);
+                    row.components[1].setDisabled(currentPage === pagedEmbeds.length - 1);
+                    await i.update({ embeds: pagedEmbeds[currentPage], components: [row] });
+                })().catch(error => logCollectorError('Manga pagination failed:', error));
             });
 
-            collector.on('end', async () => {
+            collector.on('end', () => {
                 row.components.forEach(component => component.setDisabled(true));
-                await interaction.editReply({ components: [row] });
+                void message.edit({ components: [row] }).catch(error => logCollectorError('Manga pagination cleanup failed:', error));
             });
 
         } catch (error) {
             console.error('Manga search command failed:', error);
-            await interaction.editReply({ content: 'An error occurred while fetching manga data. Please try again later.' });
+            await interaction.editReply({ content: 'Manga data is temporarily unavailable. Please try again later.', embeds: [], components: [] });
         }
     } else if (interaction.options.getSubcommand() === 'recommend') {
         await interaction.deferReply();
         const genre = interaction.options.getString('genre');
 
-        const sendRecommendation = async () => {
-            const result = await fetchAndSendMangaRecommendation(interaction, genre);
-            if (result.content) {
+        let active = true;
+        let busy = false;
+        const sendRecommendation = async (): Promise<boolean> => {
+            const result = await fetchMangaRecommendation(genre);
+            if (!active) return false;
+            if (!result.ok) {
                 await interaction.editReply({ content: result.content, embeds: [], components: [] });
+                return false;
             } else {
-                await interaction.editReply({ embeds: result.embeds, components: result.components });
+                await interaction.editReply({ content: null, embeds: result.embeds, components: result.components });
+                return true;
             }
         };
 
-        await sendRecommendation();
+        if (!await sendRecommendation()) return;
 
         const message = await interaction.fetchReply();
         const collector = message.createMessageComponentCollector({ componentType: ComponentType.Button, time: 300000 }); // 5 minutes
 
-        collector.on('collect', async i => {
-            if (i.customId === 'next_recommendation') {
-                await i.deferUpdate();
+        collector.on('collect', i => {
+            void (async () => {
+                if (i.customId !== 'manga:recommend:next') return;
+                if (i.user.id !== interaction.user.id) {
+                    await i.reply({ content: `These buttons aren\'t for you!`, ephemeral: true });
+                    return;
+                }
+                if (busy) {
+                    await i.reply({ content: 'A recommendation is already loading.', ephemeral: true });
+                    return;
+                }
+                busy = true;
+                const disabledRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+                    new ButtonBuilder().setCustomId('manga:recommend:next').setLabel('Next Recommendation').setStyle(ButtonStyle.Primary).setDisabled(true)
+                );
+                await i.update({ components: [disabledRow] });
                 await sendRecommendation();
-            }
+                busy = false;
+            })().catch(error => {
+                busy = false;
+                logCollectorError('Manga recommendation control failed:', error);
+            });
         });
 
-        collector.on('end', async () => {
+        collector.on('end', () => {
+            active = false;
             const disabledRow = new ActionRowBuilder<ButtonBuilder>()
                 .addComponents(
                     new ButtonBuilder()
-                        .setCustomId('next_recommendation')
+                        .setCustomId('manga:recommend:next')
                         .setLabel('Next Recommendation')
                         .setStyle(ButtonStyle.Primary)
                         .setDisabled(true)
                 );
-            await interaction.editReply({ components: [disabledRow] });
+            void message.edit({ components: [disabledRow] }).catch(error => logCollectorError('Manga recommendation cleanup failed:', error));
         });
     }
 };

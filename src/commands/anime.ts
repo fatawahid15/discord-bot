@@ -1,6 +1,6 @@
 import { SlashCommandBuilder } from '@discordjs/builders';
 import { ChatInputCommandInteraction, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType } from 'discord.js';
-import { request } from 'undici';
+import { isUnknownMessage, jikanArray, jikanObject, logCollectorError, randomJikanId, validMalId } from '../jikan';
 
 // --- Jikan API Interfaces ---
 interface JikanAnime {
@@ -84,18 +84,18 @@ export const execute = async (interaction: ChatInputCommandInteraction) => {
         }
 
         try {
-            const animeResponse = await request(`https://api.jikan.moe/v4/anime?q=${encodeURIComponent(title)}`);
-            const animeData = await animeResponse.body.json() as JikanAnimeSearchResponse;
+            const animeData = (await jikanArray<JikanAnime>(`/anime?q=${encodeURIComponent(title)}`))
+                .filter(item => Boolean(item?.title && item?.url && item?.images?.jpg?.image_url));
 
-            if (!animeData.data || animeData.data.length === 0) {
+            if (animeData.length === 0) {
                 await interaction.editReply(`Could not find any results for "${title}".`);
                 return;
             }
 
             const pagedEmbeds: EmbedBuilder[][] = [];
             const itemsPerPage = 5;
-            for (let i = 0; i < animeData.data.length; i += itemsPerPage) {
-                const chunk = animeData.data.slice(i, i + itemsPerPage);
+            for (let i = 0; i < animeData.length; i += itemsPerPage) {
+                const chunk = animeData.slice(i, i + itemsPerPage);
                 const pageEmbeds = chunk.map(anime => {
                     return new EmbedBuilder()
                         .setColor('#0099ff')
@@ -118,12 +118,12 @@ export const execute = async (interaction: ChatInputCommandInteraction) => {
             const row = new ActionRowBuilder<ButtonBuilder>()
                 .addComponents(
                     new ButtonBuilder()
-                        .setCustomId('previous')
+                        .setCustomId('anime:search:previous')
                         .setLabel('Previous')
                         .setStyle(ButtonStyle.Primary)
                         .setDisabled(true),
                     new ButtonBuilder()
-                        .setCustomId('next')
+                        .setCustomId('anime:search:next')
                         .setLabel('Next')
                         .setStyle(ButtonStyle.Primary)
                         .setDisabled(pagedEmbeds.length === 1)
@@ -136,73 +136,70 @@ export const execute = async (interaction: ChatInputCommandInteraction) => {
 
             const collector = message.createMessageComponentCollector({ componentType: ComponentType.Button, time: 60000 });
 
-            collector.on('collect', async i => {
-                if (i.user.id !== interaction.user.id) {
-                    i.reply({ content: `These buttons aren\'t for you!`, ephemeral: true });
-                    return;
-                }
+            collector.on('collect', i => {
+                void (async () => {
+                    if (i.user.id !== interaction.user.id) {
+                        await i.reply({ content: `These buttons aren\'t for you!`, ephemeral: true });
+                        return;
+                    }
 
-                if (i.customId === 'next') {
-                    currentPage++;
-                } else if (i.customId === 'previous') {
-                    currentPage--;
-                }
-
-                row.components[0].setDisabled(currentPage === 0);
-                row.components[1].setDisabled(currentPage === pagedEmbeds.length - 1);
-
-                await i.update({
-                    embeds: pagedEmbeds[currentPage],
-                    components: [row]
-                });
+                    if (i.customId === 'anime:search:next') currentPage++;
+                    else if (i.customId === 'anime:search:previous') currentPage--;
+                    currentPage = Math.max(0, Math.min(currentPage, pagedEmbeds.length - 1));
+                    row.components[0].setDisabled(currentPage === 0);
+                    row.components[1].setDisabled(currentPage === pagedEmbeds.length - 1);
+                    await i.update({ embeds: pagedEmbeds[currentPage], components: [row] });
+                })().catch(error => logCollectorError('Anime pagination failed:', error));
             });
 
-            collector.on('end', async () => {
+            collector.on('end', () => {
                 row.components.forEach(component => component.setDisabled(true));
-                await interaction.editReply({ components: [row] });
+                void message.edit({ components: [row] }).catch(error => logCollectorError('Anime pagination cleanup failed:', error));
             });
 
         } catch (error) {
             console.error('Anime search command failed:', error);
-            await interaction.editReply({ content: 'An error occurred while fetching anime data. Please try again later.' });
+            await interaction.editReply({ content: 'Anime data is temporarily unavailable. Please try again later.', embeds: [], components: [] });
         }
     } else if (interaction.options.getSubcommand() === 'recommend') {
         await interaction.deferReply();
         const genre = interaction.options.getString('genre');
 
-        const sendRecommendation = async () => {
+        let active = true;
+        let busy = false;
+        const recommendationRow = (disabled = false) => new ActionRowBuilder<ButtonBuilder>().addComponents(
+            new ButtonBuilder().setCustomId('anime:recommend:next').setLabel('Next Recommendation').setStyle(ButtonStyle.Primary).setDisabled(disabled)
+        );
+
+        const sendRecommendation = async (): Promise<boolean> => {
             try {
                 let animeId: number;
 
                 if (genre) {
-                    const genresResponse = await request('https://api.jikan.moe/v4/genres/anime');
-                    const genresData = await genresResponse.body.json() as JikanGenresResponse;
-                    const genreObj = genresData.data.find((g: JikanGenre) => g.name.toLowerCase() === genre.toLowerCase());
+                    const genresData = await jikanArray<JikanGenre>('/genres/anime');
+                    const genreObj = genresData.find((g: JikanGenre) => g.name.toLowerCase() === genre.toLowerCase());
 
                     if (!genreObj) {
-                        await interaction.editReply(`Could not find the genre "${genre}". Please check the spelling.`);
-                        return;
+                        if (active) await interaction.editReply({ content: `Could not find the genre "${genre}". Please check the spelling.`, embeds: [], components: [] });
+                        return false;
                     }
 
-                    const animeResponse = await request(`https://api.jikan.moe/v4/anime?genres=${genreObj.mal_id}&order_by=score&sort=desc`);
-                    const animeData = await animeResponse.body.json() as JikanAnimeSearchResponse;
+                    const animeData = await jikanArray<JikanAnime>(`/anime?genres=${genreObj.mal_id}&order_by=score&sort=desc`);
 
-                    if (!animeData.data || animeData.data.length === 0) {
-                        await interaction.editReply(`Could not find any anime in the "${genre}" genre.`);
-                        return;
+                    const candidates = animeData.filter(item => validMalId(item?.mal_id));
+                    if (!candidates.length) {
+                        if (active) await interaction.editReply({ content: `Could not find any anime in the "${genre}" genre.`, embeds: [], components: [] });
+                        return false;
                     }
 
-                    animeId = animeData.data[Math.floor(Math.random() * animeData.data.length)].mal_id;
+                    animeId = candidates[Math.floor(Math.random() * candidates.length)].mal_id;
 
                 } else {
-                    const randomResponse = await request('https://api.jikan.moe/v4/random/anime');
-                    const randomData = await randomResponse.body.json() as JikanRandomResponse;
-                    animeId = randomData.data.mal_id;
+                    animeId = await randomJikanId('anime');
                 }
 
-                const fullAnimeResponse = await request(`https://api.jikan.moe/v4/anime/${animeId}/full`);
-                const fullAnimeData = await fullAnimeResponse.body.json() as JikanAnimeFullResponse;
-                const anime = fullAnimeData.data;
+                const anime = await jikanObject<JikanAnimeFull>(`/anime/${animeId}/full`);
+                if (!anime.title || !anime.url || !anime.images?.jpg?.image_url) throw new Error('Jikan returned incomplete anime data.');
 
                 const animeEmbed = new EmbedBuilder()
                     .setColor('#0099ff')
@@ -221,50 +218,54 @@ export const execute = async (interaction: ChatInputCommandInteraction) => {
                         },
                         { 
                             name: '\⭐ Popularity', 
-                            value: `• **Score:** ${anime.score ? anime.score.toString() : 'N/A'}/100\n• **Rank:** #${anime.rank ? anime.rank.toString() : 'N/A'}\n• **Popularity Rank:** #${anime.popularity ? anime.popularity.toString() : 'N/A'}`,
+                            value: `• **Score:** ${anime.score ? anime.score.toString() : 'N/A'}/10\n• **Rank:** #${anime.rank ? anime.rank.toString() : 'N/A'}\n• **Popularity Rank:** #${anime.popularity ? anime.popularity.toString() : 'N/A'}`,
                             inline: true
                         }
                     )
                     .setFooter({ text: `Source: MyAnimeList`, iconURL: 'https://cdn.myanimelist.net/img/sp/icon/apple-touch-icon-256.png' });
 
-                const row = new ActionRowBuilder<ButtonBuilder>()
-                    .addComponents(
-                        new ButtonBuilder()
-                            .setCustomId('next_recommendation')
-                            .setLabel('Next Recommendation')
-                            .setStyle(ButtonStyle.Primary)
-                    );
-
-                await interaction.editReply({ embeds: [animeEmbed], components: [row] });
+                if (!active) return false;
+                await interaction.editReply({ content: null, embeds: [animeEmbed], components: [recommendationRow()] });
+                return true;
 
             } catch (error) {
                 console.error('Anime recommend command failed:', error);
-                await interaction.editReply({ content: 'An error occurred while fetching an anime recommendation. Please try again later.' });
+                if (isUnknownMessage(error) || !active) return false;
+                await interaction.editReply({ content: 'Anime recommendations are temporarily unavailable. Please try again later.', embeds: [], components: [] })
+                    .catch(editError => logCollectorError('Anime recommendation error reply failed:', editError));
+                return false;
             }
         };
 
-        await sendRecommendation();
+        if (!await sendRecommendation()) return;
 
         const message = await interaction.fetchReply();
         const collector = message.createMessageComponentCollector({ componentType: ComponentType.Button, time: 300000 }); // 5 minutes
 
-        collector.on('collect', async i => {
-            if (i.customId === 'next_recommendation') {
-                await i.deferUpdate();
+        collector.on('collect', i => {
+            void (async () => {
+                if (i.customId !== 'anime:recommend:next') return;
+                if (i.user.id !== interaction.user.id) {
+                    await i.reply({ content: `These buttons aren\'t for you!`, ephemeral: true });
+                    return;
+                }
+                if (busy) {
+                    await i.reply({ content: 'A recommendation is already loading.', ephemeral: true });
+                    return;
+                }
+                busy = true;
+                await i.update({ components: [recommendationRow(true)] });
                 await sendRecommendation();
-            }
+                busy = false;
+            })().catch(error => {
+                busy = false;
+                logCollectorError('Anime recommendation control failed:', error);
+            });
         });
 
-        collector.on('end', async () => {
-            const disabledRow = new ActionRowBuilder<ButtonBuilder>()
-                .addComponents(
-                    new ButtonBuilder()
-                        .setCustomId('next_recommendation')
-                        .setLabel('Next Recommendation')
-                        .setStyle(ButtonStyle.Primary)
-                        .setDisabled(true)
-                );
-            await interaction.editReply({ components: [disabledRow] });
+        collector.on('end', () => {
+            active = false;
+            void message.edit({ components: [recommendationRow(true)] }).catch(error => logCollectorError('Anime recommendation cleanup failed:', error));
         });
     }
 };
